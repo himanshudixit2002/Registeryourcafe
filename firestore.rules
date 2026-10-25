@@ -1,0 +1,591 @@
+rules_version = '2';
+
+// =============================================================================
+// Firestore security rules — Registeryourcafe
+// -----------------------------------------------------------------------------
+// CRITICAL: Firestore allows max 10 get() calls per rule evaluation.
+// All write rules use a 3-tier short-circuit to stay within budget:
+//   1. isSuperAdmin()        — 0 gets (token.email check only)
+//   2. isCompanyOwner()      — 2 gets (exists + get on company doc) — full bypass
+//   3. staffPermissionCheck  — 2 gets (userDoc + permissionRoleSnap) — granular
+// Total worst case for staff: 4 gets. Well within the 10 limit.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Auth helpers ─────────────────────────────────────────────────
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return signedIn() && request.auth.token.email == 'himanshudixit2406@gmail.com';
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userData() {
+      return userDoc().data;
+    }
+
+    // ── Tenant membership (1 get: userDoc) ───────────────────────────
+
+    function userCompanyIdMatchesPath(companyId) {
+      let c = userData().get('companyId', null);
+      return c != null
+        && (
+          c == companyId
+          || (c is string && c == companyId)
+          || (c is int && string(c) == companyId)
+          || (c is float && string(c) == companyId)
+        );
+    }
+
+    function sameCompany(companyId) {
+      return signedIn()
+        && userDoc().exists
+        && userCompanyIdMatchesPath(companyId);
+    }
+
+    // ── Company owner (2 gets: exists + get on company doc) ──────────
+
+    function companyDoc(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId));
+    }
+
+    function isCompanyOwner(companyId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/companies/$(companyId))
+        && companyDoc(companyId).data.ownerUid == request.auth.uid;
+    }
+
+    function companyAccess(companyId) {
+      return sameCompany(companyId) || isCompanyOwner(companyId);
+    }
+
+    // ── Staff RBAC (2 gets: userDoc + permissionRoleSnap) ────────────
+    // These functions are ONLY called after isSuperAdmin() and
+    // isCompanyOwner() have already been checked and failed.
+    // They must NOT re-call isCompanyOwner to avoid budget explosion.
+
+    function userPermissionRoleDocId() {
+      let rid = userData().get('roleId', '');
+      let coarse = userData().get('role', '');
+      return rid is string && rid != ''
+        ? rid
+        : (coarse == 'admin' || coarse == 'Admin' ? 'owner' : 'staff');
+    }
+
+    function permissionRoleSnap(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId)/permissionRoles/$(userPermissionRoleDocId()));
+    }
+
+    // Single-permission check for staff (no owner/SA re-check).
+    function staffHasPermission(companyId, permissionId) {
+      return permissionRoleSnap(companyId).exists
+        && permissionRoleSnap(companyId).data.get('permissionIds', []).hasAny([permissionId]);
+    }
+
+    // Multi-permission check: pass a list, returns true if role has ANY of them.
+    // Uses a single get() on the permissionRoleSnap (Firestore caches within eval).
+    function staffHasAnyPermission(companyId, permissionIds) {
+      return permissionRoleSnap(companyId).exists
+        && permissionRoleSnap(companyId).data.get('permissionIds', []).hasAny(permissionIds);
+    }
+
+    // ── Path matchers for tenant subcollections ──────────────────────
+
+    function isPermissionRolesDoc(rest) {
+      return rest.matches('permissionRoles/[^/]+');
+    }
+
+    function companyCustomerDocRest(rest) {
+      return rest.matches('customers/[^/]+$');
+    }
+
+    function isLoyaltyConversionsDoc(rest) {
+      return rest.matches('loyalty_conversions/[^/]+$');
+    }
+
+    function isLoyaltySettingsDoc(rest) {
+      return rest.matches('loyalty_settings/[^/]+$');
+    }
+
+    function isLeaderboardSettingsDoc(rest) {
+      return rest.matches('leaderboard_settings/[^/]+$');
+    }
+
+    function isLeaderboardResetsDoc(rest) {
+      return rest.matches('leaderboard_resets/[^/]+$');
+    }
+
+    function isPointAdjustmentsDoc(rest) {
+      return rest.matches('point_adjustments/[^/]+$');
+    }
+
+    function isMembershipTypeDefinitionsDoc(rest) {
+      return rest.matches('membership_type_definitions/[^/]+$');
+    }
+
+    function isTableTypeDefinitionsDoc(rest) {
+      return rest.matches('table_type_definitions/[^/]+$');
+    }
+
+    function isStockItemsDoc(rest) {
+      return rest.matches('stock_items/[^/]+$');
+    }
+
+    function isVendorsDoc(rest) {
+      return rest.matches('vendors/[^/]+$');
+    }
+
+    function isStockReceiptsDoc(rest) {
+      return rest.matches('stock_receipts/[^/]+$');
+    }
+
+    function isCategoriesDoc(rest) {
+      return rest.matches('categories/[^/]+$');
+    }
+
+    // ── Customer credit invariants ───────────────────────────────────
+
+    function creditsWouldBeNegative() {
+      return request.resource.data.keys().hasAny(['credits'])
+        && request.resource.data.credits is number
+        && request.resource.data.credits < 0;
+    }
+
+    function customerCreateAllowed() {
+      return !creditsWouldBeNegative();
+    }
+
+    function customerUpdateAllowed() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['gameStats', 'updatedAt'])
+        || !creditsWouldBeNegative();
+    }
+
+    // ── Public discovery helpers ─────────────────────────────────────
+
+    function publicDiscoveryEnabled(companyId) {
+      return exists(/databases/$(database)/documents/publicVenues/$(companyId))
+        && get(/databases/$(database)/documents/publicVenues/$(companyId)).data.get('showOnDiscovery', false) == true;
+    }
+
+    // ── Floor booking request validation ─────────────────────────────
+
+    function floorBookingRequestCreateValid() {
+      let d = request.resource.data;
+      return d.keys().hasOnly([
+          'tableId', 'tableName', 'startAt', 'endAt', 'guestName', 'guestPhone',
+          'guestEmail', 'note', 'status', 'requesterUid', 'createdAt'
+        ])
+        && d.tableId is string
+        && d.tableId.size() > 0
+        && d.tableName is string
+        && d.startAt is timestamp
+        && d.endAt is timestamp
+        && d.endAt > d.startAt
+        && (d.endAt.toMillis() - d.startAt.toMillis() >= 15 * 60 * 1000)
+        && (d.endAt.toMillis() - d.startAt.toMillis() <= 8 * 60 * 60 * 1000)
+        && d.guestName is string
+        && d.guestName.size() > 0
+        && d.guestPhone is string
+        && d.guestPhone.size() > 0
+        && d.guestPhone.size() <= 32
+        && d.guestName.size() <= 120
+        && d.status == 'pending'
+        && d.requesterUid == request.auth.uid
+        && d.createdAt is timestamp
+        && d.guestEmail is string
+        && d.guestEmail.size() <= 200
+        && d.note is string
+        && d.note.size() <= 500;
+    }
+
+    function floorBookingRequestStaffUpdateValid() {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      return resource.data.status == 'pending'
+        && (request.resource.data.status == 'approved'
+            || request.resource.data.status == 'declined')
+        && request.resource.data.decidedByUid == request.auth.uid
+        && diff.hasOnly(['status', 'decidedByUid', 'decisionNote', 'updatedAt', 'publicSlotId'])
+        && request.resource.data.updatedAt is timestamp
+        && (!('decisionNote' in request.resource.data)
+            || (request.resource.data.decisionNote is string
+                && request.resource.data.decisionNote.size() <= 500))
+        && (!('publicSlotId' in request.resource.data)
+            || request.resource.data.publicSlotId is string);
+    }
+
+    function publicBookingSlotWriteValid() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['tableId', 'startAt', 'endAt', 'requestId', 'updatedAt'])
+        && d.tableId is string
+        && d.tableId.size() > 0
+        && d.startAt is timestamp
+        && d.endAt is timestamp
+        && d.endAt > d.startAt
+        && d.requestId is string
+        && d.requestId.size() > 0
+        && d.updatedAt is timestamp;
+    }
+
+    // ── Guest cafe order validation ──────────────────────────────────
+
+    function guestCafeOrderCreateValid(companyId) {
+      let d = request.resource.data;
+      return publicDiscoveryEnabled(companyId)
+        && signedIn()
+        && d.keys().hasOnly([
+          'items', 'total', 'status', 'requesterUid', 'createdAt',
+          'guestName', 'guestPhone', 'orderMode', 'tableId', 'tableName', 'guestNotes'
+        ])
+        && d.items is list
+        && d.items.size() > 0
+        && d.items.size() <= 25
+        && d.total is number
+        && d.total >= 0
+        && d.total < 10000000
+        && d.status == 'pending'
+        && d.requesterUid == request.auth.uid
+        && d.requesterUid is string
+        && d.guestName is string
+        && d.guestName.size() > 0
+        && d.guestName.size() <= 120
+        && d.guestPhone is string
+        && d.guestPhone.size() > 0
+        && d.guestPhone.size() <= 32
+        && d.orderMode is string
+        && (d.orderMode == 'table' || d.orderMode == 'counter')
+        && d.tableId is string
+        && d.tableId.size() <= 128
+        && d.tableName is string
+        && d.tableName.size() <= 200
+        && d.guestNotes is string
+        && d.guestNotes.size() <= 500
+        && d.createdAt is timestamp
+        && (
+          d.orderMode == 'counter'
+          || (d.tableId.size() > 0 && d.tableName.size() > 0)
+        );
+    }
+
+    function guestCafeOrderStaffUpdateValid() {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      let d = request.resource.data;
+      return resource.data.status == 'pending'
+        && (
+          (diff.hasOnly(['status', 'convertedCafeOrderId', 'updatedAt'])
+            && d.status == 'converted'
+            && d.convertedCafeOrderId is string
+            && d.convertedCafeOrderId.size() > 0
+            && d.updatedAt is timestamp)
+          || (diff.hasOnly(['status', 'updatedAt'])
+            && d.status == 'cancelled'
+            && d.updatedAt is timestamp)
+        );
+    }
+
+    // ── Staff invite validation ──────────────────────────────────────
+
+    function userInviteFieldKeysValid() {
+      let k = request.resource.data.keys();
+      return k.hasOnly(['email', 'name', 'companyId', 'role', 'roleId'])
+        || k.hasOnly(['email', 'name', 'phoneNumber', 'companyId', 'role', 'roleId']);
+    }
+
+    function ownerCreatesCompanyMember(userId, companyId) {
+      return signedIn()
+        && userId is string
+        && companyId is string
+        && userId != request.auth.uid
+        && isCompanyOwner(companyId)
+        && userDoc().exists
+        && userCompanyIdMatchesPath(companyId)
+        && request.resource.data.companyId == companyId
+        && request.resource.data.roleId is string
+        && request.resource.data.roleId != 'owner'
+        && request.resource.data.role is string
+        && request.resource.data.email is string
+        && request.resource.data.name is string
+        && userInviteFieldKeysValid();
+    }
+
+    function ownerUpdatesMemberRole(userId) {
+      return signedIn()
+        && userId is string
+        && userId != request.auth.uid
+        && resource.data.companyId is string
+        && request.resource.data.companyId == resource.data.companyId
+        && isCompanyOwner(resource.data.companyId)
+        && userDoc().exists
+        && userCompanyIdMatchesPath(resource.data.companyId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'roleId'])
+        && request.resource.data.roleId is string
+        && request.resource.data.roleId != 'owner'
+        && request.resource.data.role is string;
+    }
+
+    // ── Staff granular permission gate for the catch-all ─────────────
+    // Called ONLY when isSuperAdmin and isCompanyOwner already failed.
+    // Checks sameCompany (1 get: userDoc) + permissionRoleSnap (1 get).
+    // Total: 2 gets for ANY write — well within the 10-get limit.
+
+    function staffCanWriteInCatchAll(companyId, rest) {
+      return sameCompany(companyId)
+        && !isPermissionRolesDoc(rest)
+        && (!companyCustomerDocRest(rest) || customerCreateAllowed())
+        && (!isLoyaltyConversionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.loyalty_convert', 'ops.loyalty_configure']))
+        && (!isLoyaltySettingsDoc(rest)
+            || staffHasPermission(companyId, 'ops.loyalty_configure'))
+        && (!isLeaderboardSettingsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isLeaderboardResetsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isPointAdjustmentsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isMembershipTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.membership_types_configure', 'ops.customers_admin', 'nav.customers']))
+        && (!isTableTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.table_types_configure', 'ops.table_configure', 'nav.tables']))
+        && (!isStockItemsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isVendorsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isStockReceiptsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isCategoriesDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'nav.cafe', 'ops.merchandise_manage']));
+    }
+
+    function staffCanUpdateInCatchAll(companyId, rest) {
+      return sameCompany(companyId)
+        && !isPermissionRolesDoc(rest)
+        && (!companyCustomerDocRest(rest) || customerUpdateAllowed())
+        && (!isLoyaltyConversionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.loyalty_convert', 'ops.loyalty_configure']))
+        && (!isLoyaltySettingsDoc(rest)
+            || staffHasPermission(companyId, 'ops.loyalty_configure'))
+        && (!isLeaderboardSettingsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isLeaderboardResetsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isPointAdjustmentsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isMembershipTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.membership_types_configure', 'ops.customers_admin', 'nav.customers']))
+        && (!isTableTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.table_types_configure', 'ops.table_configure', 'nav.tables']))
+        && (!isStockItemsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isVendorsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isStockReceiptsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isCategoriesDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'nav.cafe', 'ops.merchandise_manage']));
+    }
+
+    function staffCanDeleteInCatchAll(companyId, rest) {
+      return sameCompany(companyId)
+        && !isPermissionRolesDoc(rest)
+        && (!isLeaderboardSettingsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isLeaderboardResetsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isPointAdjustmentsDoc(rest)
+            || staffHasPermission(companyId, 'ops.leaderboard_manage'))
+        && (!isMembershipTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.membership_types_configure', 'ops.customers_admin', 'nav.customers']))
+        && (!isTableTypeDefinitionsDoc(rest)
+            || staffHasAnyPermission(companyId, ['ops.table_types_configure', 'ops.table_configure', 'nav.tables']))
+        && (!isStockItemsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isVendorsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isStockReceiptsDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'ops.cafe_admin', 'ops.merchandise_manage']))
+        && (!isCategoriesDoc(rest)
+            || staffHasAnyPermission(companyId, ['nav.inventory', 'nav.cafe', 'ops.merchandise_manage']));
+    }
+
+    // ── Same-tenant peer read (for staff listing) ────────────────────
+
+    function callerSharesCompanyWith(targetCompanyId) {
+      let c = userData().get('companyId', null);
+      return c != null && targetCompanyId != null
+        && (
+          c == targetCompanyId
+          || (c is string && targetCompanyId is string && c == targetCompanyId)
+          || (c is string && targetCompanyId is int && c == string(targetCompanyId))
+          || (c is int && targetCompanyId is string && string(c) == targetCompanyId)
+        );
+    }
+
+    // =====================================================================
+    //  COLLECTION MATCHES
+    // =====================================================================
+
+    // --- Public venue directory ---
+    // create: any signed-in user may create during registration (the company doc
+    // doesn't exist yet in the same batch, so companyAccess would fail).
+    match /publicVenues/{companyId} {
+      allow read: if (resource.data.get('showOnDiscovery', false) == true)
+        || isSuperAdmin()
+        || companyAccess(companyId);
+      allow create: if isSuperAdmin() || signedIn();
+      allow update, delete: if isSuperAdmin()
+        || (signedIn() && companyAccess(companyId));
+    }
+
+    // --- User profiles (self + owner-managed staff) ---
+    match /users/{userId} {
+      allow read: if (signedIn() && request.auth.uid == userId)
+        || isSuperAdmin()
+        || (signedIn() && resource.data.companyId is string && resource.data.companyId != ''
+            && userDoc().exists && callerSharesCompanyWith(resource.data.companyId));
+      allow create: if isSuperAdmin()
+        || (signedIn()
+          && (
+            request.auth.uid == userId
+            || ownerCreatesCompanyMember(userId, request.resource.data.companyId)
+          ));
+      allow update: if isSuperAdmin()
+        || (signedIn()
+          && (
+            (
+              request.auth.uid == userId
+              && (resource.data.get('companyId', '') == ''
+                  || request.resource.data.companyId == resource.data.companyId)
+            )
+            || ownerUpdatesMemberRole(userId)
+          ));
+      allow delete: if false;
+    }
+
+    match /guestProfiles/{uid} {
+      allow read, write: if isSuperAdmin()
+        || (signedIn() && request.auth.uid == uid);
+    }
+
+    match /guestWallets/{uid} {
+      allow read, write: if isSuperAdmin()
+        || (signedIn() && request.auth.uid == uid);
+    }
+
+    match /platformConfig/{document=**} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    match /superAdmins/{uid} {
+      allow read: if isSuperAdmin();
+    }
+
+    // --- Company root document ---
+    match /companies/{companyId} {
+      allow read: if isSuperAdmin() || companyAccess(companyId);
+      allow create: if signedIn()
+        && request.auth.uid == request.resource.data.ownerUid
+        && request.resource.data.name is string;
+      allow update: if isSuperAdmin() || companyAccess(companyId);
+      allow delete: if isSuperAdmin() || isCompanyOwner(companyId);
+    }
+
+    // --- RBAC role definitions (owner-writable) ---
+    match /companies/{companyId}/permissionRoles/{roleId} {
+      allow read: if isSuperAdmin() || companyAccess(companyId);
+      allow create, update, delete: if isSuperAdmin() || isCompanyOwner(companyId);
+    }
+
+    // --- Floor booking requests ---
+    match /companies/{companyId}/floor_booking_requests/{requestId} {
+      allow read: if isSuperAdmin()
+        || companyAccess(companyId)
+        || (signedIn() && resource.data.requesterUid == request.auth.uid);
+      allow create: if publicDiscoveryEnabled(companyId)
+        && signedIn()
+        && floorBookingRequestCreateValid();
+      allow update: if isSuperAdmin()
+        || (companyAccess(companyId) && floorBookingRequestStaffUpdateValid());
+      allow delete: if false;
+    }
+
+    // --- Public booking slots ---
+    match /companies/{companyId}/public_booking_slots/{slotId} {
+      allow read: if isSuperAdmin() || publicDiscoveryEnabled(companyId) || companyAccess(companyId);
+      allow create: if isSuperAdmin() || (companyAccess(companyId) && publicBookingSlotWriteValid());
+      allow update: if isSuperAdmin() || (companyAccess(companyId) && publicBookingSlotWriteValid());
+      allow delete: if isSuperAdmin() || companyAccess(companyId);
+    }
+
+    // --- Guest orders from public menu ---
+    match /companies/{companyId}/guest_cafe_orders/{orderId} {
+      allow read: if isSuperAdmin() || companyAccess(companyId);
+      allow create: if guestCafeOrderCreateValid(companyId);
+      allow update: if isSuperAdmin()
+        || (companyAccess(companyId) && guestCafeOrderStaffUpdateValid());
+      allow delete: if false;
+    }
+
+    // --- Reviews ---
+    match /companies/{companyId}/reviews/{reviewId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.reviewerUid == request.auth.uid
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5;
+      allow update: if isSuperAdmin()
+        || (signedIn()
+            && (request.auth.uid == resource.data.reviewerUid
+                || companyAccess(companyId)));
+      allow delete: if isSuperAdmin() || companyAccess(companyId);
+    }
+
+    // --- Support tickets ---
+    match /companies/{companyId}/supportTickets/{ticketId} {
+      allow read: if isSuperAdmin() || companyAccess(companyId);
+      allow create: if signedIn() && companyAccess(companyId);
+      allow update: if isSuperAdmin() || companyAccess(companyId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  TENANT CATCH-ALL (sessions, orders, stock, customers, etc.)
+    // ─────────────────────────────────────────────────────────────────
+    // 3-tier short-circuit keeps get() calls within budget:
+    //   Tier 1: isSuperAdmin()    → 0 gets
+    //   Tier 2: isCompanyOwner()  → 2 gets → full bypass (no permission checks)
+    //   Tier 3: staffCan*()       → 2 gets (userDoc + permissionRoleSnap)
+    // ─────────────────────────────────────────────────────────────────
+    match /companies/{companyId}/{rest=**} {
+
+      allow read: if isSuperAdmin()
+        || companyAccess(companyId)
+        || (rest.matches('tournaments/[^/]+$')
+            && 'showOnPublicLanding' in resource.data
+            && resource.data.showOnPublicLanding == true)
+        || (rest.matches('public_floor/[^/]+$') && publicDiscoveryEnabled(companyId))
+        || (rest.matches('public_menu_items/[^/]+$') && publicDiscoveryEnabled(companyId))
+        || (rest.matches('public_booking_slots/[^/]+$') && publicDiscoveryEnabled(companyId));
+
+      allow create: if isSuperAdmin()
+        || isCompanyOwner(companyId)
+        || staffCanWriteInCatchAll(companyId, rest);
+
+      allow update: if isSuperAdmin()
+        || isCompanyOwner(companyId)
+        || staffCanUpdateInCatchAll(companyId, rest);
+
+      allow delete: if isSuperAdmin()
+        || isCompanyOwner(companyId)
+        || staffCanDeleteInCatchAll(companyId, rest);
+    }
+  }
+}

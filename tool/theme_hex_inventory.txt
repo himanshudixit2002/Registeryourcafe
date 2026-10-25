@@ -1,0 +1,26 @@
+Theme cleanup — hardcoded Color(0x…) outside lib/theme/app_theme.dart
+Generated for optional follow-up mapping to ColorScheme / AppSemanticColors.
+
+membership_tier_colors.dart
+  Deliberate tier brand (gold/silver/bronze + neutral default). Keep or expose via ThemeExtension if themes should override.
+
+leaderboard_competition_screen.dart
+  Rank medal accents (gold, bronze). Map: sem.warning / cs.tertiary or small ThemeExtension.rankMedalGold|Bronze.
+
+table_grid_screen.dart
+  primaryGreen, dining orange/amber chips. Map: AppSemanticColors.success, sem.warning, cs.error (destructive), surfaceContainer for chip backgrounds.
+
+sellable_stock_item_card.dart
+  Category palette (brown, teal, orange, pink, green, blue-grey). Map: hash category → SalesPalette-style or cs.primary / sem / outline variants.
+
+table_card.dart
+  Occupied brown vs available green; footer destructive red. Map: sem.success (available), sem.warning or custom tableOccupied token; cs.error for destructive.
+
+landing_home_tab.dart
+  Marketing card accents (indigo, sky, emerald). Map: cs.primary, sem.info, sem.success or keep as landing brand constants.
+
+customer_ui_components.dart
+  Default badge bronze0xFFCD7F32. Map: sem.warning or MembershipTierColors.label('bronze').
+
+app_theme.dart
+  Source of truth for brand/shell/semantic seed colors — do not duplicate; reference AppTheme.successColor etc. from widgets where appropriate.

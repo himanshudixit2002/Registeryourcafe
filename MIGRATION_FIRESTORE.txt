@@ -1,0 +1,12 @@
+Legacy single-tenant data (top-level collections such as customers, tables, sessions, tournaments, etc.) must be moved under one Firestore company document, for example companies/LEGACY_ID/.
+
+Steps (outline):
+1. Choose a legacyCompanyId string (e.g. "legacy" or a UUID).
+2. Export existing top-level collections from the Firebase console or gcloud firestore export.
+3. For each logical collection name used in the app (see lib/constants/firestore_collections.dart), import or script-copy documents into companies/{legacyCompanyId}/{collectionName}/{docId}, preserving document IDs where possible.
+4. For nested paths (e.g. customers/{id}/credit_transactions), keep the same nesting under companies/{legacyCompanyId}/customers/{id}/credit_transactions/{txId}.
+5. Update every users/{uid} document: set companyId to legacyCompanyId (and keep role as before).
+6. Deploy firestore.rules and firestore.indexes.json (firebase deploy --only firestore).
+7. Smoke-test login, one table session, one order, and one tournament.
+
+If there is no production data yet, skip migration and rely on Register company + fresh nested paths only.

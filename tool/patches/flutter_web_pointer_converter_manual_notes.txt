@@ -1,0 +1,49 @@
+Manual Flutter web SDK notes (pointer_converter.dart + framework converter)
+==========================================================================
+
+Primary fix (most important)
+----------------------------
+The crash:
+  Assertion failed: events.dart:1639 !identical(kind, PointerDeviceKind.trackpad)
+comes from the **framework** `PointerEventConverter`, not only the web engine.
+
+Patch the Flutter SDK **framework** file:
+  $FLUTTER_ROOT/packages/flutter/lib/src/gestures/converter.dart
+
+Re-run after every `flutter upgrade`:
+  ./tool/apply_flutter_web_trackpad_fix.sh
+
+This runs `tool/patch_flutter_framework_converter_trackpad.py`, which maps
+`trackpad` → `mouse` for pointer phases that forbid trackpad (hover/move/down/up/…)
+while leaving scroll signals using the original `kind`.
+
+Optional engine file (typical):
+  $FLUTTER_ROOT/bin/cache/flutter_web_sdk/lib/_engine/engine/pointer_converter.dart
+
+After `flutter upgrade`, engine cache is replaced. Re-run:
+  ./tool/apply_flutter_web_trackpad_fix.sh
+
+What to preserve when merging upgrades
+--------------------------------------
+
+Framework asserts that PointerMoveEvent must not use PointerDeviceKind.trackpad.
+The engine usually maps trackpad to mouse for synthesized moves (see branches for
+ui.PointerChange.move and scroll / wheel paths).
+
+If an upgrade removes those remappings and you see assertions referencing
+gestures/events.dart or pointer_converter.dart, restore the pattern:
+
+  final ui.PointerDeviceKind moveKind =
+      kind == ui.PointerDeviceKind.trackpad
+          ? ui.PointerDeviceKind.mouse
+          : kind;
+
+…when emitting ui.PointerChange.move with _synthesizePointerData or
+_generateCompletePointerData.
+
+References: https://github.com/flutter/flutter/issues/174215 and related web
+gesture issues.
+
+Optional: save a unified diff against your SDK into
+  tool/patches/flutter_web_pointer_converter.patch
+and the apply script will use it when the built-in heuristics are missing.

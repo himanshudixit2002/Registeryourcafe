@@ -1,0 +1,58 @@
+# Deploy Flutter web to Firebase Hosting.
+#
+# Setup:
+# 1. Firebase Console → Project settings → Service accounts → Generate new private key (JSON).
+# 2. GitHub repo → Settings → Secrets → Actions → add FIREBASE_SERVICE_ACCOUNT with the full JSON.
+#    Or use FIREBASE_TOKEN from `firebase login:ci` as a single-line secret instead (see script comment).
+#
+# Run: Actions → "Deploy Firebase Hosting" → Run workflow
+
+name: Deploy Firebase Hosting
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Flutter analyze
+        run: flutter analyze
+
+      - name: Flutter test
+        run: flutter test
+
+      - name: Build web
+        run: flutter build web --release
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Deploy to Hosting
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "${FIREBASE_SERVICE_ACCOUNT:-}" ]; then
+            echo "Missing secret FIREBASE_SERVICE_ACCOUNT. Add JSON from Firebase Console (service account) to repo secrets."
+            exit 1
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "${RUNNER_TEMP}/gcp.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="${RUNNER_TEMP}/gcp.json"
+          firebase deploy --only hosting --non-interactive
